@@ -12,9 +12,7 @@ Sidebar:
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
-import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +21,9 @@ import pandas as pd
 import streamlit as st
 
 ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
+# Make all project packages importable for in-process pipeline calls
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 from data.init_db import init_db, DB_PATH  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -166,8 +166,24 @@ def render_sidebar():
     st.sidebar.divider()
 
     st.sidebar.subheader("Pipeline")
-    if st.sidebar.button("▶  Run Full Pipeline Now", use_container_width=True, type="primary"):
+
+    # Initialise the running flag on first load
+    if "pipeline_running" not in st.session_state:
+        st.session_state.pipeline_running = False
+
+    btn_disabled = st.session_state.pipeline_running
+    if st.sidebar.button(
+        "⏳ Running…" if btn_disabled else "▶  Run Full Pipeline Now",
+        use_container_width=True,
+        type="primary",
+        disabled=btn_disabled,
+    ):
+        st.session_state.pipeline_running = True
+        st.rerun()   # redraw immediately so button shows disabled before heavy work starts
+
+    if st.session_state.pipeline_running:
         _run_pipeline()
+        st.session_state.pipeline_running = False
 
     st.sidebar.divider()
     st.sidebar.subheader("Database")
@@ -190,44 +206,106 @@ def render_sidebar():
 
 
 def _run_pipeline():
-    """Run the four pipeline scripts in sequence, streaming output to a Streamlit container."""
-    steps = [
-        ("📰 Fetching news",           [sys.executable, str(ROOT / "ingestion"  / "fetch_news.py")]),
-        ("🔍 Extracting signals",      [sys.executable, str(ROOT / "processing" / "extract_signals.py")]),
-        ("🔗 Cross-referencing people",[sys.executable, str(ROOT / "processing" / "cross_reference.py")]),
-        ("📝 Generating brief",        [sys.executable, str(ROOT / "processing" / "generate_brief.py")]),
-    ]
+    """Run the four pipeline stages in-process with per-company progress UI."""
+    import ingestion.fetch_news       as _fetch_news
+    import processing.extract_signals as _extract
+    import processing.cross_reference as _xref
+    import processing.generate_brief  as _brief
 
-    placeholder = st.empty()
-    log_lines: list[str] = []
+    conn = db()
+    companies = [dict(r) for r in conn.execute(
+        "SELECT id, name FROM companies ORDER BY name"
+    ).fetchall()]
+    n = len(companies)
 
-    def _update(line: str):
-        log_lines.append(line)
-        placeholder.code("\n".join(log_lines[-60:]), language="text")  # keep last 60 lines
+    # Snapshot counts before the run so we can compute deltas for the summary
+    news_before    = conn.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
+    signals_before = conn.execute("SELECT COUNT(*) FROM extracted_signals").fetchone()[0]
+    moves_before   = conn.execute("SELECT COUNT(*) FROM executive_moves").fetchone()[0]
 
-    for label, cmd in steps:
-        _update(f"\n{'─'*50}")
-        _update(f"  {label} ...")
-        _update(f"{'─'*50}")
+    # --- UI widgets ---
+    status    = st.empty()          # single-line status text
+    progress  = st.progress(0.0)    # 0–1 progress bar
+    error_box = st.empty()          # errors accumulate here
 
+    errors: list[str] = []
+
+    def _set(msg: str, frac: float):
+        status.markdown(f"**{msg}**")
+        progress.progress(min(frac, 1.0))
+
+    def _err(msg: str):
+        errors.append(msg)
+        error_box.warning("\n\n".join(errors))
+
+    # ── Stage 1: Fetch news (1/4 of the bar, per-company progress) ──────────
+    news_results = []
+    for i, company in enumerate(companies):
+        _set(
+            f"📰 Fetching news for **{company['name']}** ({i + 1}/{n})…",
+            (i / n) * 0.25,
+        )
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=str(ROOT),
+            results = _fetch_news.run(
+                company_filter=company["id"],
+                max_articles_per_company=10,
             )
-            for line in proc.stdout:
-                _update(line.rstrip())
-            proc.wait()
-            if proc.returncode != 0:
-                _update(f"⚠  Step exited with code {proc.returncode}")
+            news_results.extend(results)
         except Exception as exc:
-            _update(f"✗  Error running {cmd[1]}: {exc}")
+            _err(f"fetch_news [{company['name']}]: {exc}")
 
-    _update("\n✓  Pipeline complete. Refresh the page to see updated data.")
-    st.cache_resource.clear()   # bust the DB connection cache so new data shows immediately
+    # ── Stage 2: Extract signals (1/4 of the bar, per-company progress) ─────
+    extract_results = []
+    for i, company in enumerate(companies):
+        _set(
+            f"🔍 Extracting signals for **{company['name']}** ({i + 1}/{n})…",
+            0.25 + (i / n) * 0.25,
+        )
+        try:
+            result = _extract.run(
+                company_filter=company["id"],
+                per_company_limit=5,
+            )
+            extract_results.append(result)
+        except Exception as exc:
+            _err(f"extract_signals [{company['name']}]: {exc}")
+
+    # ── Stage 3: Cross-reference (single step, bar moves to 75%) ────────────
+    _set("🔗 Cross-referencing people across portfolio…", 0.75)
+    try:
+        _xref.run()
+    except Exception as exc:
+        _err(f"cross_reference: {exc}")
+
+    # ── Stage 4: Generate brief (single step, bar moves to 95%) ─────────────
+    _set("📝 Generating weekly brief…", 0.95)
+    try:
+        _brief.run(stream_to_terminal=False)
+    except Exception as exc:
+        _err(f"generate_brief: {exc}")
+
+    # ── Done ─────────────────────────────────────────────────────────────────
+    progress.progress(1.0)
+    status.empty()
+
+    st.cache_resource.clear()   # force DB reconnect so metrics refresh
+    conn = db()                 # get fresh connection after cache clear
+
+    news_after    = conn.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
+    signals_after = conn.execute("SELECT COUNT(*) FROM extracted_signals").fetchone()[0]
+    moves_after   = conn.execute("SELECT COUNT(*) FROM executive_moves").fetchone()[0]
+
+    new_news    = news_after    - news_before
+    new_signals = signals_after - signals_before
+    new_moves   = moves_after   - moves_before
+
+    st.success(
+        f"✅ Pipeline complete — "
+        f"**{n}** companies · "
+        f"**{new_news}** new articles · "
+        f"**{new_signals}** signals extracted · "
+        f"**{new_moves}** exec moves found"
+    )
 
 
 # ---------------------------------------------------------------------------

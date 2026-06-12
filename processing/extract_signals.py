@@ -301,6 +301,7 @@ def run(
     limit: int = BATCH_SIZE,
     company_filter: str | None = None,
     dry_run: bool = False,
+    per_company_limit: int = 0,   # 0 = no cap; set e.g. 5 for fast dashboard runs
 ) -> ExtractionResult:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -317,7 +318,7 @@ def run(
         params.append(company_filter)
     params.append(limit)
 
-    articles = conn.execute(
+    all_articles = conn.execute(
         f"""
         SELECT
             ni.id, ni.company_id, ni.title, ni.content,
@@ -333,6 +334,18 @@ def run(
         """,
         params,
     ).fetchall()
+
+    # Apply per-company cap: keep the N most-recent articles per company
+    if per_company_limit > 0:
+        seen: dict[str, int] = {}
+        articles = []
+        for row in all_articles:
+            cid = row["company_id"]
+            if seen.get(cid, 0) < per_company_limit:
+                articles.append(row)
+                seen[cid] = seen.get(cid, 0) + 1
+    else:
+        articles = all_articles
 
     if not articles:
         log.info("No unprocessed articles found.")

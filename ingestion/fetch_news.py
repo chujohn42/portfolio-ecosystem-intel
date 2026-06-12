@@ -224,6 +224,7 @@ def fetch_company(
     limiter: RateLimiter,
     from_date: str,
     dry_run: bool = False,
+    max_articles: int = 0,        # 0 = no cap
 ) -> FetchResult:
     result = FetchResult(company_id=company["id"], company_name=company["name"])
     query = build_query(company)
@@ -235,6 +236,9 @@ def fetch_company(
         result.errors.append(f"API fetch failed: {exc}")
         log.error("  [%s] fetch failed: %s", company["id"], exc)
         return result
+
+    if max_articles > 0:
+        articles = articles[:max_articles]
 
     for art in articles:
         url = (art.get("url") or "").strip()
@@ -294,6 +298,7 @@ def run(
     days: int = LOOKBACK_DAYS,
     company_filter: str | None = None,
     dry_run: bool = False,
+    max_articles_per_company: int = 0,   # 0 = no cap; set e.g. 10 for fast dashboard runs
 ) -> list[FetchResult]:
     newsapi_key = os.environ.get("NEWSAPI_KEY", "")
     if not newsapi_key:
@@ -323,7 +328,11 @@ def run(
 
     results: list[FetchResult] = []
     for company in companies:
-        result = fetch_company(company, conn, limiter, from_date, dry_run=dry_run)
+        result = fetch_company(
+            company, conn, limiter, from_date,
+            dry_run=dry_run,
+            max_articles=max_articles_per_company,
+        )
         results.append(result)
         log.info("  %s", result)
 
