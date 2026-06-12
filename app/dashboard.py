@@ -212,16 +212,21 @@ def _run_pipeline():
     import processing.cross_reference as _xref
     import processing.generate_brief  as _brief
 
-    conn = db()
-    companies = [dict(r) for r in conn.execute(
+    # Open a dedicated short-lived connection for this function — never use the
+    # cached get_db() connection here because st.cache_resource connections are
+    # created on the main thread and Streamlit may invoke _run_pipeline() on a
+    # different thread, which triggers sqlite3.ProgrammingError. check_same_thread=False
+    # is set in init_db() so any connection is safe to use across threads.
+    pconn = init_db()
+    companies = [dict(r) for r in pconn.execute(
         "SELECT id, name FROM companies ORDER BY name"
     ).fetchall()]
     n = len(companies)
 
     # Snapshot counts before the run so we can compute deltas for the summary
-    news_before    = conn.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
-    signals_before = conn.execute("SELECT COUNT(*) FROM extracted_signals").fetchone()[0]
-    moves_before   = conn.execute("SELECT COUNT(*) FROM executive_moves").fetchone()[0]
+    news_before    = pconn.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
+    signals_before = pconn.execute("SELECT COUNT(*) FROM extracted_signals").fetchone()[0]
+    moves_before   = pconn.execute("SELECT COUNT(*) FROM executive_moves").fetchone()[0]
 
     # --- UI widgets ---
     status    = st.empty()          # single-line status text
@@ -288,12 +293,15 @@ def _run_pipeline():
     progress.progress(1.0)
     status.empty()
 
-    st.cache_resource.clear()   # force DB reconnect so metrics refresh
-    conn = db()                 # get fresh connection after cache clear
+    # Read final counts on the same dedicated connection, then close it.
+    # After this, clear the cache so the UI's shared connection is re-created
+    # fresh on the next rerun and picks up all the new rows.
+    news_after    = pconn.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
+    signals_after = pconn.execute("SELECT COUNT(*) FROM extracted_signals").fetchone()[0]
+    moves_after   = pconn.execute("SELECT COUNT(*) FROM executive_moves").fetchone()[0]
+    pconn.close()
 
-    news_after    = conn.execute("SELECT COUNT(*) FROM news_items").fetchone()[0]
-    signals_after = conn.execute("SELECT COUNT(*) FROM extracted_signals").fetchone()[0]
-    moves_after   = conn.execute("SELECT COUNT(*) FROM executive_moves").fetchone()[0]
+    st.cache_resource.clear()   # force cached get_db() to reconnect on next render
 
     new_news    = news_after    - news_before
     new_signals = signals_after - signals_before
