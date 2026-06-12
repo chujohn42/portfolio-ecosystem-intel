@@ -263,8 +263,8 @@ def tab_weekly_brief():
         _render_brief(text, selected_file.name, {})
         return
 
-    # Normal path — briefs in DB
-    options = {f"{b['week_label']} ({b['brief_date']})": b for b in briefs}
+    # Normal path — briefs in DB; convert to dict so .get() is safe everywhere
+    options = {f"{b['week_label']} ({b['brief_date']})": dict(b) for b in briefs}
     choice  = st.selectbox("Select week", list(options.keys()))
     brief   = options[choice]
 
@@ -324,7 +324,7 @@ def tab_company_detail():
     since   = _since(days)
 
     # --- Company header ---
-    meta = conn.execute("SELECT * FROM companies WHERE id = ?", (company["id"],)).fetchone()
+    meta = dict(conn.execute("SELECT * FROM companies WHERE id = ?", (company["id"],)).fetchone())
     ticker_str = f" · {meta['ticker']}" if meta.get("ticker") else ""
     st.subheader(f"{meta['name']}{ticker_str}")
     c1, c2, c3 = st.columns(3)
