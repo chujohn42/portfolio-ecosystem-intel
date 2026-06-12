@@ -37,19 +37,74 @@ st.set_page_config(
     initial_sidebar_state = "expanded",
 )
 
-BRIEFS_DIR = ROOT / "briefs"
+BRIEFS_DIR        = ROOT / "briefs"
+COMPANIES_JSON    = ROOT / "data" / "companies.json"
 
 # ---------------------------------------------------------------------------
-# DB connection — cached for the session lifetime
+# DB bootstrap — cached so it runs exactly once per Streamlit process.
+#
+# Streamlit Cloud resets the filesystem on every deploy/restart, so
+# portfolio.db is always missing at boot. This function:
+#   1. Calls init_db() — creates all tables and indexes (idempotent DDL)
+#   2. Checks whether the companies table is empty
+#   3. If empty, seeds from data/companies.json on the same connection
+#
+# Using @st.cache_resource means the returned connection is reused for every
+# rerun in the same session, and the setup block only executes once per
+# Streamlit worker process — not on every user interaction.
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
 def get_db():
-    return init_db()
+    """Return a fully-initialised, seeded SQLite connection."""
+    conn = init_db()   # creates schema + runs _migrate(); safe to call repeatedly
+
+    # Seed companies if the table is empty (fresh DB on Streamlit Cloud, or first run)
+    count = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+    if count == 0:
+        _seed_companies(conn)
+
+    return conn
+
+
+def _seed_companies(conn) -> None:
+    """Insert companies from data/companies.json into an open connection."""
+    import json as _json
+
+    if not COMPANIES_JSON.exists():
+        st.warning(f"companies.json not found at {COMPANIES_JSON} — skipping seed.")
+        return
+
+    with open(COMPANIES_JSON, encoding="utf-8") as f:
+        companies = _json.load(f)
+
+    # Ensure ticker/notes columns exist (added after initial schema)
+    existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(companies)").fetchall()}
+    for col in ("ticker", "notes"):
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE companies ADD COLUMN {col} TEXT")
+
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO companies
+            (id, name, domain, sector, stage, hq, description, keywords, ticker, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                c["id"], c["name"],
+                c.get("domain"), c.get("sector"), c.get("stage"), c.get("hq"),
+                c.get("description"), _json.dumps(c.get("keywords", [])),
+                c.get("ticker"), c.get("notes"),
+            )
+            for c in companies
+        ],
+    )
+    conn.commit()
 
 
 def db():
-    """Return the shared connection."""
+    """Return the shared, bootstrapped connection."""
     return get_db()
 
 
