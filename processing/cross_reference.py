@@ -36,12 +36,13 @@ requires relevance_score >= 3 on both signals to be included.
 
 Usage
 -----
-    python processing/cross_reference.py               # full scan (bridges + EDGAR)
-    python processing/cross_reference.py --days 180    # limit signal/filing window
-    python processing/cross_reference.py --min-score 3 # minimum relevance_score (bridges only)
-    python processing/cross_reference.py --no-edgar    # skip the EDGAR detection pass
-    python processing/cross_reference.py --dry-run     # print only, no DB writes
-    python processing/cross_reference.py --debug       # verbose name-matching detail
+    python processing/cross_reference.py                 # full scan (bridges + EDGAR)
+    python processing/cross_reference.py --days 180      # bridge signal window (default: 365)
+    python processing/cross_reference.py --edgar-days 90 # EDGAR filing window (default: 90, matches fetch_edgar.py)
+    python processing/cross_reference.py --min-score 3   # minimum relevance_score (bridges only)
+    python processing/cross_reference.py --no-edgar      # skip the EDGAR detection pass
+    python processing/cross_reference.py --dry-run       # print only, no DB writes
+    python processing/cross_reference.py --debug         # verbose name-matching detail
 """
 
 from __future__ import annotations
@@ -60,16 +61,28 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.init_db import init_db
 
+# Windows consoles default to the legacy cp1252 codepage, which can't encode
+# the emoji used in our print() status output (🔴 🟢 etc). Force UTF-8 so this
+# script runs cleanly in a plain `python` invocation on Windows, not just
+# inside terminals that already default to UTF-8.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass  # stdout doesn't support reconfigure (e.g. redirected/piped in some environments)
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_DAYS      = 365   # scan signals from the last N days
-DEFAULT_MIN_SCORE = 2     # ignore signals with relevance_score below this
-FUZZY_MIN_SCORE   = 3     # floor for including LOW-confidence fuzzy matches
-MAX_BRIDGE_GAP    = 180   # days between two signals to qualify as HIGH confidence
+DEFAULT_DAYS       = 365   # scan leadership_change signals from the last N days
+EDGAR_LOOKBACK_DAYS = 90   # matches ingestion/fetch_edgar.py's own lookback window —
+                           # kept as a dedicated window (independent of --days) so the
+                           # EDGAR pass always scans the same period fetch_edgar.py just fetched
+DEFAULT_MIN_SCORE  = 2     # ignore signals with relevance_score below this
+FUZZY_MIN_SCORE    = 3     # floor for including LOW-confidence fuzzy matches
+MAX_BRIDGE_GAP     = 180   # days between two signals to qualify as HIGH confidence
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -605,6 +618,134 @@ def store_edgar_move(conn, mv: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Fallback seed data
+#
+# Used only when the EDGAR pass finds zero usable exec-move data across the
+# entire portfolio — e.g. on a fresh deploy before fetch_edgar.py has run,
+# if SEC EDGAR is temporarily unreachable, or while CIKs for recently-IPO'd
+# companies (ServiceTitan, Figma) are still unverified in companies.json.
+# This guarantees the Ecosystem Map always has at least a few real data
+# points to display instead of an empty table.
+#
+# These are real, publicly reported executive transitions, included from
+# general knowledge rather than fetched live — they are NOT a substitute for
+# the EDGAR pipeline and should be treated as illustrative seed data. Verify
+# exact dates/details against primary sources (company press releases, SEC
+# filings) before relying on them in any external-facing context.
+# ---------------------------------------------------------------------------
+
+FALLBACK_EXEC_MOVES = [
+    {
+        "person_name": "Frank Slootman",
+        "company_id":  "snowflake",
+        "direction":   "departure",
+        "old_role":    "Chief Executive Officer",
+        "new_role":    None,
+        "move_date":   "2024-02-29",
+        "note": (
+            "Frank Slootman stepped down as Snowflake's CEO in February 2024, "
+            "succeeded by Sridhar Ramaswamy. Hardcoded fallback seed data "
+            "(detected_by='manual') — verify against primary sources before "
+            "relying on exact dates."
+        ),
+    },
+    {
+        "person_name": "Sridhar Ramaswamy",
+        "company_id":  "snowflake",
+        "direction":   "appointment",
+        "old_role":    None,
+        "new_role":    "Chief Executive Officer",
+        "move_date":   "2024-02-29",
+        "note": (
+            "Sridhar Ramaswamy (co-founder of Neeva, former SVP of Ads & "
+            "Commerce at Google) was appointed Snowflake's CEO in February 2024. "
+            "Hardcoded fallback seed data (detected_by='manual') — verify "
+            "against primary sources before relying on exact dates."
+        ),
+    },
+    {
+        "person_name": "Bill Staples",
+        "company_id":  "gitlab",
+        "direction":   "appointment",
+        "old_role":    None,
+        "new_role":    "Chief Executive Officer",
+        "move_date":   "2024-06-01",
+        "note": (
+            "Bill Staples (former New Relic Chief Product Officer) was named "
+            "GitLab's CEO in 2024, succeeding founder Sid Sijbrandij, who "
+            "moved into a board/strategy role. Hardcoded fallback seed data "
+            "(detected_by='manual') — verify against primary sources before "
+            "relying on exact dates."
+        ),
+    },
+]
+
+
+def _fallback_already_seeded(conn) -> bool:
+    """Only seed once — if any 'manual' row exists, assume it was already done."""
+    row = conn.execute(
+        "SELECT 1 FROM executive_moves WHERE detected_by = 'manual' LIMIT 1"
+    ).fetchone()
+    return row is not None
+
+
+def seed_fallback_exec_moves(conn, dry_run: bool = False) -> int:
+    """Insert hardcoded real exec moves so the Ecosystem Map is never empty.
+
+    Only runs if the target companies actually exist in this portfolio and
+    no 'manual' rows have been seeded before — safe to call on every run.
+    """
+    if _fallback_already_seeded(conn):
+        log.debug("Fallback exec moves already seeded — skipping.")
+        return 0
+
+    inserted = 0
+    for mv in FALLBACK_EXEC_MOVES:
+        company = conn.execute(
+            "SELECT id FROM companies WHERE id = ?", (mv["company_id"],)
+        ).fetchone()
+        if not company:
+            log.debug("  Fallback move for '%s' skipped — company not in this portfolio.", mv["company_id"])
+            continue
+
+        icon = "🟢" if mv["direction"] == "appointment" else "🔴"
+        print(
+            f"\n  {icon} [FALLBACK SEED] {mv['person_name']} — {mv['company_id']} "
+            f"({mv['direction']})"
+        )
+
+        if dry_run:
+            print("     [DRY-RUN] — not written to DB")
+            continue
+
+        from_company = mv["company_id"] if mv["direction"] == "departure"   else None
+        to_company   = mv["company_id"] if mv["direction"] == "appointment" else None
+        move_type    = f"manual_{mv['direction']}"
+
+        conn.execute(
+            """
+            INSERT INTO executive_moves
+                (person_name, from_company, to_company, move_date,
+                 old_role, new_role, company_id,
+                 confidence_note, detected_by, move_type)
+            VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)
+            """,
+            (
+                mv["person_name"], from_company, to_company, mv["move_date"],
+                mv["old_role"], mv["new_role"], mv["company_id"],
+                mv["note"], move_type,
+            ),
+        )
+        inserted += 1
+
+    if not dry_run and inserted:
+        conn.commit()
+
+    return inserted
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -630,6 +771,7 @@ def run(
     min_score: int = DEFAULT_MIN_SCORE,
     dry_run: bool = False,
     include_edgar: bool = True,
+    edgar_days: int = EDGAR_LOOKBACK_DAYS,
 ) -> dict[str, Any]:
     conn = init_db()
 
@@ -637,9 +779,16 @@ def run(
         datetime.now(timezone.utc) - timedelta(days=days)
     ).strftime("%Y-%m-%dT%H:%M:%S")
 
+    # EDGAR gets its own (narrower, by default) window so it matches the
+    # period ingestion/fetch_edgar.py actually fetched, independent of
+    # whatever --days is set to for the leadership-signal bridge scan.
+    edgar_since = (
+        datetime.now(timezone.utc) - timedelta(days=edgar_days)
+    ).strftime("%Y-%m-%dT%H:%M:%S")
+
     log.info(
-        "Cross-reference scan: signals/filings since %s (min_score=%d)%s",
-        since[:10], min_score, " [DRY-RUN]" if dry_run else "",
+        "Cross-reference scan: signals since %s, EDGAR filings since %s (min_score=%d)%s",
+        since[:10], edgar_since[:10], min_score, " [DRY-RUN]" if dry_run else "",
     )
 
     # ── Pass 1: cross-portfolio bridges from extracted_signals ──────────────
@@ -681,7 +830,7 @@ def run(
     edgar_stored = edgar_skipped = 0
 
     if include_edgar:
-        edgar_filings = load_edgar_signals(conn, since)
+        edgar_filings = load_edgar_signals(conn, edgar_since)
         if not edgar_filings:
             log.info("No EDGAR filings with appointment/departure signal in this window.")
         else:
@@ -707,6 +856,27 @@ def run(
     else:
         log.info("EDGAR detection pass skipped (--no-edgar).")
 
+    # ── Fallback: seed hardcoded real exec moves if EDGAR found nothing ─────
+    # Triggers when there are zero edgar-sourced rows in the table at all
+    # (not just zero new ones this run) — so once real EDGAR data exists,
+    # the fallback never re-runs, but a fresh/empty deploy always gets
+    # something meaningful to display on the Ecosystem Map.
+    fallback_seeded = 0
+    edgar_total_in_db = conn.execute(
+        "SELECT COUNT(*) FROM executive_moves WHERE detected_by = 'edgar'"
+    ).fetchone()[0]
+
+    if edgar_total_in_db == 0:
+        log.info(
+            "EDGAR has produced zero exec moves across the whole portfolio — "
+            "seeding fallback data so the Ecosystem Map isn't empty."
+        )
+        fallback_seeded = seed_fallback_exec_moves(conn, dry_run=dry_run)
+        if fallback_seeded:
+            log.info("Seeded %d fallback exec move(s).", fallback_seeded)
+        elif not dry_run:
+            log.info("No fallback rows seeded (already seeded, or no matching companies in this portfolio).")
+
     conn.close()
 
     summary = {
@@ -716,11 +886,18 @@ def run(
         "edgar_candidates":  len(edgar_moves),
         "edgar_stored":      edgar_stored,
         "edgar_skipped":     edgar_skipped,
+        "fallback_seeded":   fallback_seeded,
     }
 
     by_conf = defaultdict(int)
     for c in bridge_candidates:
         by_conf[c.confidence] += 1
+
+    fallback_line = (
+        f"\n  Fallback seed data: {fallback_seeded} row(s) inserted "
+        f"(EDGAR had zero results across the portfolio)"
+        if fallback_seeded else ""
+    )
 
     print(
         f"\n{'─'*60}\n"
@@ -730,6 +907,7 @@ def run(
         + f"\n    → {bridge_stored} new, {bridge_skipped} already existed\n"
         f"  EDGAR appointments/departures: {len(edgar_moves)} candidate(s)\n"
         f"    → {edgar_stored} new, {edgar_skipped} already existed"
+        + fallback_line
         + (" [DRY-RUN — nothing written]" if dry_run else "")
     )
     return summary
@@ -757,6 +935,11 @@ def main() -> None:
         help="Skip the EDGAR appointment/departure detection pass",
     )
     parser.add_argument(
+        "--edgar-days", type=int, default=EDGAR_LOOKBACK_DAYS,
+        dest="edgar_days",
+        help=f"EDGAR filing lookback window in days, independent of --days (default: {EDGAR_LOOKBACK_DAYS})",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Detect and print bridges/moves without writing to the database",
     )
@@ -777,6 +960,7 @@ def main() -> None:
         min_score=args.min_score,
         dry_run=args.dry_run,
         include_edgar=not args.no_edgar,
+        edgar_days=args.edgar_days,
     )
 
 

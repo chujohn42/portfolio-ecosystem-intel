@@ -13,9 +13,19 @@ and back off on 429/503. User-Agent header is required (SEC policy).
 
 Deduplication: accession_no is UNIQUE in edgar_filings.
 
+CIK resolution:
+    companies.json may include a "cik" field per company (10-digit zero-padded
+    SEC Central Index Key). When present, it is used directly for the EFTS
+    "ciks" filter param, which is more reliable than ticker/entity-name
+    matching. The stored CIK is still cross-checked against SEC's live
+    ticker→CIK map (company_tickers.json) on every run; on a mismatch the
+    live-resolved CIK wins and a warning is logged, so a stale or fat-fingered
+    value in companies.json can never silently produce wrong results.
+    If no CIK is stored, we fall back fully to ticker-based resolution.
+
 Usage:
-    python ingestion/fetch_edgar.py                    # all public companies, 30-day window
-    python ingestion/fetch_edgar.py --days 90          # wider window
+    python ingestion/fetch_edgar.py                    # all public companies, 90-day window
+    python ingestion/fetch_edgar.py --days 180         # wider window
     python ingestion/fetch_edgar.py --ticker SNOW      # single ticker
     python ingestion/fetch_edgar.py --dry-run          # no DB writes
     python ingestion/fetch_edgar.py --debug            # verbose logging
@@ -54,7 +64,8 @@ EDGAR_ARCHIVES    = "https://www.sec.gov/Archives/edgar/data"
 
 REQUEST_INTERVAL = 0.15   # 10 req/s max → 0.1 s floor; we use 0.15 for safety
 MAX_RETRIES      = 4
-LOOKBACK_DAYS    = 30     # 8-K filings are time-sensitive; 30 days is a useful default
+LOOKBACK_DAYS    = 90     # widened from 30 — exec-move 8-Ks are infrequent per company,
+                          # so a longer window is needed to reliably find any in a given run
 
 # 8-K Item 5.02 keywords that indicate executive movement
 EXEC_KEYWORDS = [
@@ -140,28 +151,72 @@ def _get(url: str, params: dict | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 _cik_cache: dict[str, str] = {}
+_ticker_map_cache: dict | None = None
 
 
-def resolve_cik(ticker: str) -> str | None:
-    """Return the zero-padded CIK for a ticker, or None if not found."""
-    if ticker in _cik_cache:
-        return _cik_cache[ticker]
+def _normalize_cik(raw: str) -> str:
+    """Zero-pad a CIK to 10 digits, stripping any non-digit characters."""
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    return digits.zfill(10)
 
-    # EDGAR provides a static JSON map of all tickers → CIK
-    data = _get(COMPANY_TICKERS)
-    if not data:
-        return None
+
+def _live_lookup_cik_by_ticker(ticker: str) -> str | None:
+    """Resolve a ticker → CIK using SEC's live company_tickers.json map."""
+    global _ticker_map_cache
+    if _ticker_map_cache is None:
+        _ticker_map_cache = _get(COMPANY_TICKERS) or {}
 
     ticker_upper = ticker.upper()
-    for entry in data.values():
+    for entry in _ticker_map_cache.values():
         if entry.get("ticker", "").upper() == ticker_upper:
-            cik = str(entry["cik_str"]).zfill(10)
-            _cik_cache[ticker] = cik
-            log.debug("  Resolved %s → CIK %s (%s)", ticker, cik, entry.get("title"))
-            return cik
-
-    log.warning("  Could not resolve CIK for ticker %s", ticker)
+            return _normalize_cik(entry["cik_str"])
     return None
+
+
+def resolve_cik(company: dict) -> str | None:
+    """Return the zero-padded CIK for a company.
+
+    Resolution order:
+      1. If companies.json/DB has a non-null `cik`, normalize it and verify
+         it against SEC's live ticker→CIK map. On a match, use it directly
+         (skips a network round-trip on cache hits). On a mismatch, log a
+         warning and prefer the live-resolved value — a hand-entered CIK
+         should never silently override what SEC's own data says.
+      2. If no stored CIK (or verification couldn't run), fall back to a
+         live ticker-based lookup.
+    """
+    ticker = company.get("ticker")
+    stored_cik = company.get("cik")
+    cache_key = ticker or stored_cik
+    if cache_key and cache_key in _cik_cache:
+        return _cik_cache[cache_key]
+
+    if not ticker and not stored_cik:
+        return None
+
+    live_cik = _live_lookup_cik_by_ticker(ticker) if ticker else None
+
+    if stored_cik:
+        normalized = _normalize_cik(stored_cik)
+        if live_cik and live_cik != normalized:
+            log.warning(
+                "  CIK mismatch for %s: companies.json has %s but SEC live map "
+                "resolves %s to %s — using the live-resolved value.",
+                ticker, normalized, ticker, live_cik,
+            )
+            resolved = live_cik
+        else:
+            resolved = normalized
+    elif live_cik:
+        resolved = live_cik
+    else:
+        log.warning("  Could not resolve CIK for ticker %s (no stored CIK, live lookup failed)", ticker)
+        return None
+
+    if cache_key:
+        _cik_cache[cache_key] = resolved
+    log.debug("  Resolved %s → CIK %s", ticker or stored_cik, resolved)
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +237,13 @@ def search_8k_filings(
       q         — full-text query (supports phrase quotes and OR)
       forms     — comma-separated form types
       dateRange — "custom" enables startdt/enddt
-      entity    — filters by company name/ticker (EDGAR entity filter)
+      ciks      — comma-separated list of 10-digit zero-padded CIKs; scopes
+                  results to specific filer(s). Far more reliable than the
+                  "entity" name/ticker filter, which does fuzzy text matching
+                  against company names and can miss or misattribute filings
+                  for tickers that overlap with other share classes/aliases.
       from      — pagination offset
-      hits.hits.total.value — page size (despite the confusing name, this is _size)
+      size      — page size
 
     We target Item 5.02 language. EFTS returns highlighted fragments which we
     use as snippets when the full document fetch is unavailable.
@@ -204,7 +263,7 @@ def search_8k_filings(
             "startdt":   start_date,
             "enddt":     end_date,
             "forms":     "8-K",
-            "entity":    ticker,   # EFTS entity filter — scopes results to this filer
+            "ciks":      cik,   # CIK-based filer filter — more reliable than entity/ticker matching
             "from":      offset,
             "size":      page_size,
         }
@@ -357,7 +416,7 @@ def process_company(
     ticker = company["ticker"]
     result = EdgarResult(company_id=company["id"], ticker=ticker)
 
-    cik = resolve_cik(ticker)
+    cik = resolve_cik(dict(company))
     if not cik:
         result.errors.append("CIK not found")
         return result

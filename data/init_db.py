@@ -143,6 +143,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns introduced after the initial schema — safe to run repeatedly."""
     existing_news = {r[1] for r in conn.execute("PRAGMA table_info(news_items)").fetchall()}
     existing_sig  = {r[1] for r in conn.execute("PRAGMA table_info(extracted_signals)").fetchall()}
+    existing_companies = {r[1] for r in conn.execute("PRAGMA table_info(companies)").fetchall()}
+
+    for col in ("ticker", "notes", "cik"):
+        if col not in existing_companies:
+            conn.execute(f"ALTER TABLE companies ADD COLUMN {col} TEXT")
 
     if "processed_at" not in existing_news:
         conn.execute("ALTER TABLE news_items ADD COLUMN processed_at TEXT")
@@ -174,12 +179,15 @@ def _seed_companies(conn: sqlite3.Connection) -> None:
     with open(COMPANIES_JSON) as f:
         companies = json.load(f)
     conn.executemany(
-        "INSERT OR IGNORE INTO companies (id, name, domain, sector, stage, hq, description, keywords) VALUES (?,?,?,?,?,?,?,?)",
+        """INSERT OR IGNORE INTO companies
+           (id, name, domain, sector, stage, hq, description, keywords, ticker, notes, cik)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         [
             (
                 c["id"], c["name"], c.get("domain"), c.get("sector"),
                 c.get("stage"), c.get("hq"), c.get("description"),
                 json.dumps(c.get("keywords", [])),
+                c.get("ticker"), c.get("notes"), c.get("cik"),
             )
             for c in companies
         ],

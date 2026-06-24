@@ -7,6 +7,7 @@
     "stage": "Public",
     "hq": "Bozeman, MT",
     "ticker": "SNOW",
+    "cik": "0001640147",
     "description": "AI data cloud platform enabling data sharing, analytics, and AI workloads across clouds.",
     "keywords": ["snowflake", "snowflake inc", "snow cloud", "data cloud"],
     "notes": "IPO September 2020 (NYSE: SNOW). One of ICONIQ's most prominent growth investments. FY2026 revenue ~$4.7B."
@@ -19,9 +20,10 @@
     "stage": "Public",
     "hq": "San Francisco, CA",
     "ticker": "FIG",
+    "cik": null,
     "description": "Browser-based collaborative design and prototyping platform used by product and design teams worldwide.",
     "keywords": ["figma", "figma design", "figma inc"],
-    "notes": "IPO July 2025 (NYSE: FIG). Adobe acquisition blocked by regulators in 2023. ICONIQ was an early growth investor."
+    "notes": "IPO July 2025 (NYSE: FIG). Adobe acquisition blocked by regulators in 2023. ICONIQ was an early growth investor. CIK not verified — Figma IPO'd after this data was compiled; look up via https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=figma and add it for reliable CIK-based EDGAR queries."
   },
   {
     "id": "canva",
@@ -31,6 +33,7 @@
     "stage": "Late-Stage Private",
     "hq": "Sydney, Australia",
     "ticker": null,
+    "cik": null,
     "description": "Visual communication and design platform with 240M+ monthly active users. ~$3B ARR as of 2025.",
     "keywords": ["canva", "canva design", "canva platform"],
     "notes": "Valued at $42B (Aug 2025). IPO expected H2 2026. ICONIQ participated in growth rounds."
@@ -43,6 +46,7 @@
     "stage": "Public",
     "hq": "New York, NY",
     "ticker": "DDOG",
+    "cik": "0001561550",
     "description": "Cloud infrastructure monitoring, APM, log management, and security platform for DevOps and engineering teams.",
     "keywords": ["datadog", "datadog monitoring", "ddog"],
     "notes": "IPO September 2019 (NASDAQ: DDOG). Market cap ~$83B. ICONIQ Growth invested in Series D."
@@ -55,6 +59,7 @@
     "stage": "Public",
     "hq": "San Francisco, CA",
     "ticker": "GTLB",
+    "cik": "0001653482",
     "description": "All-in-one DevSecOps platform covering source control, CI/CD, security scanning, and project management.",
     "keywords": ["gitlab", "gitlab inc", "gtlb devops"],
     "notes": "IPO October 2021 (NASDAQ: GTLB). FY2026 revenue ~$955M. ICONIQ led a major growth round pre-IPO."
@@ -67,9 +72,10 @@
     "stage": "Public",
     "hq": "Glendale, CA",
     "ticker": "TTAN",
+    "cik": null,
     "description": "End-to-end business management platform for home and commercial service contractors (HVAC, plumbing, electrical, etc.).",
     "keywords": ["servicetitan", "service titan", "ttan"],
-    "notes": "IPO December 2024 (NASDAQ: TTAN). ICONIQ Growth led the Series H ($500M) in 2021."
+    "notes": "IPO December 2024 (NASDAQ: TTAN). ICONIQ Growth led the Series H ($500M) in 2021. CIK not verified — recent IPO; look up via EDGAR company search and add for reliable CIK-based queries."
   },
   {
     "id": "procore",
@@ -79,6 +85,7 @@
     "stage": "Public",
     "hq": "Carpinteria, CA",
     "ticker": "PCOR",
+    "cik": "0001654595",
     "description": "Construction management platform connecting owners, general contractors, and subcontractors on a single system of record.",
     "keywords": ["procore", "procore technologies", "pcor construction"],
     "notes": "IPO May 2021 (NYSE: PCOR). ICONIQ Growth invested in a pre-IPO growth round."
@@ -91,6 +98,7 @@
     "stage": "Late-Stage Private",
     "hq": "San Francisco, CA",
     "ticker": null,
+    "cik": null,
     "description": "Low-code platform combining spreadsheet flexibility with database power, enabling teams to build custom apps and workflows.",
     "keywords": ["airtable", "airtable platform", "airtable app"],
     "notes": "Last valued at ~$11B (Series F, 2021). ICONIQ Growth participated in multiple rounds. IPO timeline unclear."
@@ -103,6 +111,7 @@
     "stage": "Late-Stage Private",
     "hq": "San Francisco, CA",
     "ticker": null,
+    "cik": null,
     "description": "Online visual collaboration platform and digital whiteboard used by 80M+ users for workshops, planning, and design.",
     "keywords": ["miro", "miro board", "realtimeboard"],
     "notes": "Valued at $17.5B (Series C, 2022). ICONIQ Growth led the Series C. IPO candidate."
@@ -115,6 +124,7 @@
     "stage": "Public",
     "hq": "New York, NY",
     "ticker": "CXM",
+    "cik": "0001824403",
     "description": "Unified customer experience management platform covering social, marketing, sales, and service across 30+ digital channels.",
     "keywords": ["sprinklr", "sprinklr cxm", "unified cxm"],
     "notes": "IPO June 2021 (NYSE: CXM). ICONIQ Growth was a major investor, backing the company through multiple rounds."
@@ -127,9 +137,10 @@
     "stage": "Public",
     "hq": "Amsterdam, Netherlands",
     "ticker": "ADYEN",
+    "cik": null,
     "description": "Global financial technology platform processing payments for enterprise merchants including Meta, Spotify, and Microsoft.",
     "keywords": ["adyen", "adyen payments", "adyen platform"],
-    "notes": "Listed on Euronext Amsterdam (AMS: ADYEN). Q1 2026 revenue €597M. ICONIQ held a pre-IPO stake."
+    "notes": "Listed on Euronext Amsterdam (AMS: ADYEN) only — not US-exchange listed and very likely not an SEC reporting company, so it has no CIK and will not appear in EDGAR 8-K searches. fetch_edgar.py will skip it (no CIK resolvable)."
   },
   {
     "id": "collibra",
@@ -139,6 +150,7 @@
     "stage": "Late-Stage Private",
     "hq": "New York, NY",
     "ticker": null,
+    "cik": null,
     "description": "Data intelligence platform providing data catalog, governance, quality, and lineage capabilities for enterprise data teams.",
     "keywords": ["collibra", "collibra data", "data governance collibra"],
     "notes": "Unicorn; last valued at $3.3B (2021). ICONIQ Growth led the Series E. Strong enterprise customer base."

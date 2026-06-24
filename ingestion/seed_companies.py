@@ -15,10 +15,9 @@ COMPANIES_JSON = Path(__file__).parent.parent / "data" / "companies.json"
 
 def _ensure_extra_columns(conn) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(companies)").fetchall()}
-    if "ticker" not in existing:
-        conn.execute("ALTER TABLE companies ADD COLUMN ticker TEXT")
-    if "notes" not in existing:
-        conn.execute("ALTER TABLE companies ADD COLUMN notes TEXT")
+    for col in ("ticker", "notes", "cik"):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE companies ADD COLUMN {col} TEXT")
     conn.commit()
 
 
@@ -36,8 +35,8 @@ def seed(path: Path = COMPANIES_JSON, replace: bool = False) -> int:
         before = conn.execute("SELECT id FROM companies WHERE id = ?", (c["id"],)).fetchone()
         conn.execute(
             f"""{mode} INTO companies
-               (id, name, domain, sector, stage, hq, description, keywords, ticker, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, name, domain, sector, stage, hq, description, keywords, ticker, notes, cik)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 c["id"],
                 c["name"],
@@ -49,6 +48,7 @@ def seed(path: Path = COMPANIES_JSON, replace: bool = False) -> int:
                 json.dumps(c.get("keywords", [])),
                 c.get("ticker"),
                 c.get("notes"),
+                c.get("cik"),
             ),
         )
         if before is None:

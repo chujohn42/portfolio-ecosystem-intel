@@ -78,24 +78,24 @@ def _seed_companies(conn) -> None:
     with open(COMPANIES_JSON, encoding="utf-8") as f:
         companies = _json.load(f)
 
-    # Ensure ticker/notes columns exist (added after initial schema)
+    # Ensure ticker/notes/cik columns exist (added after initial schema)
     existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(companies)").fetchall()}
-    for col in ("ticker", "notes"):
+    for col in ("ticker", "notes", "cik"):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE companies ADD COLUMN {col} TEXT")
 
     conn.executemany(
         """
         INSERT OR IGNORE INTO companies
-            (id, name, domain, sector, stage, hq, description, keywords, ticker, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, name, domain, sector, stage, hq, description, keywords, ticker, notes, cik)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
                 c["id"], c["name"],
                 c.get("domain"), c.get("sector"), c.get("stage"), c.get("hq"),
                 c.get("description"), _json.dumps(c.get("keywords", [])),
-                c.get("ticker"), c.get("notes"),
+                c.get("ticker"), c.get("notes"), c.get("cik"),
             )
             for c in companies
         ],
