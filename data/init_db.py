@@ -76,6 +76,7 @@ def init_db() -> sqlite3.Connection:
             from_company    TEXT,
             to_company      TEXT,
             source_signal_id INTEGER REFERENCES extracted_signals(id),
+            source_filing_id INTEGER REFERENCES edgar_filings(id),
             confidence_note TEXT,
             detected_by     TEXT DEFAULT 'manual',
             recorded_at     TEXT DEFAULT (datetime('now'))
@@ -84,6 +85,7 @@ def init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_exec_person   ON executive_moves(person_name);
         CREATE INDEX IF NOT EXISTS idx_exec_bridge   ON executive_moves(from_company, to_company);
         CREATE INDEX IF NOT EXISTS idx_exec_detected ON executive_moves(detected_by);
+        CREATE INDEX IF NOT EXISTS idx_exec_filing   ON executive_moves(source_filing_id);
 
         CREATE INDEX IF NOT EXISTS idx_news_company ON news_items(company_id);
         CREATE INDEX IF NOT EXISTS idx_signals_company ON extracted_signals(company_id);
@@ -155,6 +157,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("from_company",     "TEXT"),
         ("to_company",       "TEXT"),
         ("source_signal_id", "INTEGER"),
+        ("source_filing_id", "INTEGER"),
         ("confidence_note",  "TEXT"),
         ("detected_by",      "TEXT DEFAULT 'manual'"),
     ]:

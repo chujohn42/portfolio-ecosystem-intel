@@ -1,32 +1,45 @@
 """Ecosystem bridge detection: find people moving between portfolio companies.
 
-Algorithm
----------
+This script runs two independent detection passes, both writing to the same
+executive_moves table but tagged with different `detected_by` values:
+
+PASS 1 — Cross-portfolio bridges (detected_by='cross_ref')
+------------------------------------------------------------
 1. Load every extracted_signal where signal_type = 'leadership_change' that
    has a non-empty people_mentioned JSON list.
 2. Build a name index: canonical_name → list of (signal, company, date, role).
 3. For each name that appears in signals from two or more *distinct* companies,
-   or appears in one portfolio signal and also in the text of a different signal
-   with a different company attribution, emit a bridge candidate.
+   emit a bridge candidate.
 4. Rank candidates by a confidence heuristic:
      HIGH   — same name, 2+ portfolio companies, signals within 180 days
      MEDIUM — same name, portfolio + non-portfolio mention, or >180-day gap
      LOW    — fuzzy/partial name match across companies
-5. Insert qualifying candidates into executive_moves (detected_by='cross_ref'),
-   skipping rows where the same (person_name, from_company, to_company) already
-   exists to stay idempotent.
+5. Insert qualifying candidates, skipping rows where the same
+   (person_name, from_company, to_company) already exists.
 
-Name matching
--------------
+PASS 2 — EDGAR-sourced single-company moves (detected_by='edgar')
+------------------------------------------------------------------
+1. Load every edgar_filings row with exec_signal IN ('appointment','departure','both')
+   — these come from SEC 8-K Item 5.02 filings fetched by ingestion/fetch_edgar.py.
+2. Run regex-based person-name extraction over the filing snippet (best-effort —
+   SEC filing prose is unstructured; extraction is heuristic, not Claude-based).
+3. Insert a row per identified name even when no cross-company match exists:
+     appointment → to_company   = the filing's company, from_company = NULL (origin unknown / external hire)
+     departure   → from_company = the filing's company, to_company   = NULL (destination unknown)
+4. Idempotent on (detected_by='edgar', source_filing_id, person_name, move_type).
+
+Name matching (Pass 1 only)
+----------------------------
 Exact canonical match (lowercase, whitespace-normalised) is HIGH confidence.
 Fuzzy match (last-name-only or first+last transposition) is LOW confidence and
 requires relevance_score >= 3 on both signals to be included.
 
 Usage
 -----
-    python processing/cross_reference.py               # full scan
-    python processing/cross_reference.py --days 180    # limit signal window
-    python processing/cross_reference.py --min-score 3 # minimum relevance_score
+    python processing/cross_reference.py               # full scan (bridges + EDGAR)
+    python processing/cross_reference.py --days 180    # limit signal/filing window
+    python processing/cross_reference.py --min-score 3 # minimum relevance_score (bridges only)
+    python processing/cross_reference.py --no-edgar    # skip the EDGAR detection pass
     python processing/cross_reference.py --dry-run     # print only, no DB writes
     python processing/cross_reference.py --debug       # verbose name-matching detail
 """
@@ -338,6 +351,143 @@ def detect_bridges(
 
 
 # ---------------------------------------------------------------------------
+# EDGAR-sourced appointment / departure detection (Pass 2)
+#
+# edgar_filings.snippet holds raw, unstructured prose pulled from SEC 8-K
+# filings (see ingestion/fetch_edgar.py). There is no structured person field,
+# so we extract a candidate name with regex heuristics. This is intentionally
+# conservative — filings where no name can be confidently isolated are logged
+# and skipped rather than stored with a placeholder name.
+# ---------------------------------------------------------------------------
+
+# A "name" is 2-4 capitalized tokens (allows middle initials like "Jane A. Smith")
+_NAME_TOKEN = r"[A-Z][a-zA-Z'’\-]+\.?"
+_NAME_GROUP = rf"((?:{_NAME_TOKEN}\s+){{1,3}}{_NAME_TOKEN})"
+
+# Words that occasionally get swept into a name match by mistake (titles, org
+# boilerplate) — if every token in a candidate is one of these, reject it.
+_ROLE_STOPWORDS = {
+    "chief", "executive", "officer", "financial", "operating", "technology",
+    "revenue", "president", "general", "counsel", "board", "directors",
+    "company", "corporation", "item", "form", "vice", "senior", "interim",
+}
+
+_APPOINTMENT_PATTERNS = [
+    re.compile(rf"(?i:appoint(?:ed|s|ing))\s+{_NAME_GROUP}\s+(?i:as|to)\b"),
+    re.compile(rf"{_NAME_GROUP}\s+(?i:has been|was)\s+(?i:appointed|named|elected)\b"),
+    re.compile(rf"{_NAME_GROUP}\s+(?i:will\s+(?:serve as|become|join))\b"),
+    re.compile(rf"(?i:mr\.|ms\.|mrs\.|dr\.)\s+{_NAME_GROUP}\b"),
+]
+
+_DEPARTURE_PATTERNS = [
+    re.compile(rf"(?i:resignation|departure)\s+of\s+{_NAME_GROUP}\b"),
+    re.compile(rf"{_NAME_GROUP}\s+(?i:resigned|departed|stepped down|is leaving|will depart)\b"),
+]
+
+
+def extract_person_name(snippet: str, patterns: list[re.Pattern]) -> str | None:
+    """Try each pattern in order, return the first plausible name match."""
+    for pat in patterns:
+        m = pat.search(snippet)
+        if not m:
+            continue
+        candidate = m.group(1).strip()
+        tokens = [t.strip(".").lower() for t in candidate.split()]
+        if len(tokens) < 2:
+            continue   # require at least first + last name
+        if all(t in _ROLE_STOPWORDS for t in tokens):
+            continue   # entire match is title/boilerplate, not a person
+        return candidate
+    return None
+
+
+def load_edgar_signals(conn, since: str) -> list[dict]:
+    """Return edgar_filings rows that indicate an executive appointment or departure."""
+    rows = conn.execute(
+        """
+        SELECT id, company_id, ticker, accession_no, filing_date, fetched_at, snippet, exec_signal
+        FROM edgar_filings
+        WHERE exec_signal IN ('appointment', 'departure', 'both')
+          AND COALESCE(filing_date, fetched_at) >= ?
+        ORDER BY COALESCE(filing_date, fetched_at) DESC
+        """,
+        (since,),
+    ).fetchall()
+    log.info("Loaded %d EDGAR filing(s) with appointment/departure signal", len(rows))
+    return [dict(r) for r in rows]
+
+
+def detect_edgar_moves(filings: list[dict]) -> list[dict]:
+    """
+    For each filing, attempt to extract a person name for its exec_signal direction(s).
+    Returns a list of {filing, person_name, direction, note} dicts.
+    """
+    results: list[dict] = []
+
+    for f in filings:
+        snippet = (f.get("snippet") or "").strip()
+        if not snippet:
+            log.debug("  Filing %s has no snippet — skipping", f["accession_no"])
+            continue
+
+        signal = f["exec_signal"]
+        appt_name = extract_person_name(snippet, _APPOINTMENT_PATTERNS) if signal in ("appointment", "both") else None
+        dep_name  = extract_person_name(snippet, _DEPARTURE_PATTERNS)  if signal in ("departure", "both") else None
+
+        # Same name matched both directions — likely ambiguous transition language;
+        # record once as an appointment and flag for manual review.
+        if appt_name and dep_name and _canon(appt_name) == _canon(dep_name):
+            results.append({
+                "filing": f, "person_name": appt_name, "direction": "appointment",
+                "note": (
+                    f"EDGAR 8-K Item 5.02 ({f['ticker']}, accession {f['accession_no']}) — "
+                    f"ambiguous filing language matched both appointment and departure patterns "
+                    f"for the same name; recorded as appointment. Recommend manual review."
+                ),
+            })
+            log.debug("  Ambiguous both-direction match for %s in %s", appt_name, f["accession_no"])
+            continue
+
+        if appt_name:
+            results.append({
+                "filing": f, "person_name": appt_name, "direction": "appointment",
+                "note": (
+                    f"EDGAR 8-K Item 5.02 ({f['ticker']}, accession {f['accession_no']}) — "
+                    f"appointment detected via regex extraction from filing snippet."
+                ),
+            })
+            log.debug("  Appointment: %s @ %s", appt_name, f["ticker"])
+
+        if dep_name:
+            results.append({
+                "filing": f, "person_name": dep_name, "direction": "departure",
+                "note": (
+                    f"EDGAR 8-K Item 5.02 ({f['ticker']}, accession {f['accession_no']}) — "
+                    f"departure detected via regex extraction from filing snippet."
+                ),
+            })
+            log.debug("  Departure: %s @ %s", dep_name, f["ticker"])
+
+        if signal in ("appointment", "both") and not appt_name:
+            log.debug("  No appointment name extracted from %s (%s)", f["accession_no"], f["ticker"])
+        if signal in ("departure", "both") and not dep_name:
+            log.debug("  No departure name extracted from %s (%s)", f["accession_no"], f["ticker"])
+
+    return results
+
+
+def _print_edgar_move(mv: dict) -> None:
+    f = mv["filing"]
+    icon = "🟢" if mv["direction"] == "appointment" else "🔴"
+    print(
+        f"\n  {icon} [EDGAR {mv['direction'].upper()}] {mv['person_name']}\n"
+        f"     Company: {f['ticker']}  |  Filing: {f['accession_no']}  |  "
+        f"Date: {(f['filing_date'] or f['fetched_at'] or '')[:10]}\n"
+        f"     Note: {mv['note']}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
@@ -397,6 +547,63 @@ def store_bridge(conn, candidate: BridgeCandidate) -> bool:
     return True
 
 
+def _edgar_already_stored(conn, filing_id: int, person_name: str, move_type: str) -> bool:
+    """Idempotency check for EDGAR-sourced moves, keyed by the source filing."""
+    row = conn.execute(
+        """
+        SELECT 1 FROM executive_moves
+        WHERE detected_by       = 'edgar'
+          AND source_filing_id  = ?
+          AND person_name       = ?
+          AND move_type         = ?
+        LIMIT 1
+        """,
+        (filing_id, person_name, move_type),
+    ).fetchone()
+    return row is not None
+
+
+def store_edgar_move(conn, mv: dict) -> bool:
+    """Insert an EDGAR-sourced appointment/departure into executive_moves.
+
+    appointment → to_company   = filing's company, from_company = NULL (origin unknown / external hire)
+    departure   → from_company = filing's company, to_company   = NULL (destination unknown)
+    """
+    f = mv["filing"]
+    move_type = f"edgar_{mv['direction']}"
+
+    if _edgar_already_stored(conn, f["id"], mv["person_name"], move_type):
+        return False
+
+    if mv["direction"] == "appointment":
+        from_company, to_company = None, f["company_id"]
+    else:
+        from_company, to_company = f["company_id"], None
+
+    move_date = f["filing_date"] or f["fetched_at"]
+
+    conn.execute(
+        """
+        INSERT INTO executive_moves
+            (person_name, from_company, to_company, move_date,
+             company_id, source_filing_id, confidence_note, detected_by, move_type)
+        VALUES
+            (?, ?, ?, ?, ?, ?, ?, 'edgar', ?)
+        """,
+        (
+            mv["person_name"],
+            from_company,
+            to_company,
+            move_date,
+            f["company_id"],
+            f["id"],
+            mv["note"],
+            move_type,
+        ),
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -422,6 +629,7 @@ def run(
     days: int = DEFAULT_DAYS,
     min_score: int = DEFAULT_MIN_SCORE,
     dry_run: bool = False,
+    include_edgar: bool = True,
 ) -> dict[str, Any]:
     conn = init_db()
 
@@ -430,65 +638,98 @@ def run(
     ).strftime("%Y-%m-%dT%H:%M:%S")
 
     log.info(
-        "Cross-reference scan: leadership_change signals since %s (min_score=%d)%s",
+        "Cross-reference scan: signals/filings since %s (min_score=%d)%s",
         since[:10], min_score, " [DRY-RUN]" if dry_run else "",
     )
 
+    # ── Pass 1: cross-portfolio bridges from extracted_signals ──────────────
+    bridge_candidates: list[BridgeCandidate] = []
+    bridge_stored = bridge_skipped = 0
+
     records = load_leadership_signals(conn, since, min_score)
     if not records:
-        log.info("No qualifying signals found — run extract_signals.py first.")
-        conn.close()
-        return {"candidates": 0, "stored": 0, "skipped": 0}
+        log.info("No qualifying leadership_change signals found for bridge detection.")
+    else:
+        company_ids_seen = {r.company_id for r in records}
+        log.info(
+            "Scanning %d person-mentions across %d companies for cross-portfolio bridges...",
+            len(records), len(company_ids_seen),
+        )
+        bridge_candidates = detect_bridges(records)
 
-    company_ids_seen = {r.company_id for r in records}
-    log.info(
-        "Scanning %d person-mentions across %d companies for cross-portfolio bridges...",
-        len(records), len(company_ids_seen),
-    )
-
-    candidates = detect_bridges(records)
-
-    if not candidates:
-        log.info("No cross-portfolio bridges detected.")
-        conn.close()
-        return {"candidates": 0, "stored": 0, "skipped": 0}
-
-    log.info("Found %d bridge candidate(s):", len(candidates))
-
-    stored = skipped = 0
-    for c in candidates:
-        _print_candidate(c)
-
-        if dry_run:
-            print("     [DRY-RUN] — not written to DB")
-            continue
-
-        if store_bridge(conn, c):
-            stored += 1
-            log.debug("  Stored bridge: %s → %s via %s", c.from_company, c.to_company, c.person_name)
+        if not bridge_candidates:
+            log.info("No cross-portfolio bridges detected.")
         else:
-            skipped += 1
-            log.debug("  Skipped (already exists): %s", c.person_name)
+            log.info("Found %d bridge candidate(s):", len(bridge_candidates))
+            for c in bridge_candidates:
+                _print_candidate(c)
+                if dry_run:
+                    print("     [DRY-RUN] — not written to DB")
+                    continue
+                if store_bridge(conn, c):
+                    bridge_stored += 1
+                    log.debug("  Stored bridge: %s → %s via %s", c.from_company, c.to_company, c.person_name)
+                else:
+                    bridge_skipped += 1
+                    log.debug("  Skipped (already exists): %s", c.person_name)
 
-    if not dry_run:
-        conn.commit()
+            if not dry_run:
+                conn.commit()
+
+    # ── Pass 2: EDGAR-sourced single-company appointments/departures ────────
+    edgar_moves: list[dict] = []
+    edgar_stored = edgar_skipped = 0
+
+    if include_edgar:
+        edgar_filings = load_edgar_signals(conn, since)
+        if not edgar_filings:
+            log.info("No EDGAR filings with appointment/departure signal in this window.")
+        else:
+            edgar_moves = detect_edgar_moves(edgar_filings)
+            if not edgar_moves:
+                log.info("No person names could be extracted from EDGAR filings.")
+            else:
+                log.info("Found %d EDGAR-sourced exec move candidate(s):", len(edgar_moves))
+                for mv in edgar_moves:
+                    _print_edgar_move(mv)
+                    if dry_run:
+                        print("     [DRY-RUN] — not written to DB")
+                        continue
+                    if store_edgar_move(conn, mv):
+                        edgar_stored += 1
+                        log.debug("  Stored EDGAR move: %s (%s)", mv["person_name"], mv["direction"])
+                    else:
+                        edgar_skipped += 1
+                        log.debug("  Skipped (already exists): %s", mv["person_name"])
+
+                if not dry_run:
+                    conn.commit()
+    else:
+        log.info("EDGAR detection pass skipped (--no-edgar).")
 
     conn.close()
 
     summary = {
-        "candidates": len(candidates),
-        "stored":     stored,
-        "skipped":    skipped,
+        "bridge_candidates": len(bridge_candidates),
+        "bridge_stored":     bridge_stored,
+        "bridge_skipped":    bridge_skipped,
+        "edgar_candidates":  len(edgar_moves),
+        "edgar_stored":      edgar_stored,
+        "edgar_skipped":     edgar_skipped,
     }
+
     by_conf = defaultdict(int)
-    for c in candidates:
+    for c in bridge_candidates:
         by_conf[c.confidence] += 1
 
     print(
         f"\n{'─'*60}\n"
-        f"Scan complete — {len(candidates)} candidate(s) found:\n"
-        + "\n".join(f"  {k}: {v}" for k, v in sorted(by_conf.items()))
-        + f"\n{stored} new bridge(s) stored, {skipped} already existed."
+        f"Scan complete\n"
+        f"  Cross-portfolio bridges: {len(bridge_candidates)} candidate(s)"
+        + ("".join(f"\n    {k}: {v}" for k, v in sorted(by_conf.items())) if by_conf else "")
+        + f"\n    → {bridge_stored} new, {bridge_skipped} already existed\n"
+        f"  EDGAR appointments/departures: {len(edgar_moves)} candidate(s)\n"
+        f"    → {edgar_stored} new, {edgar_skipped} already existed"
         + (" [DRY-RUN — nothing written]" if dry_run else "")
     )
     return summary
@@ -512,8 +753,12 @@ def main() -> None:
         help=f"Minimum relevance_score to include (default: {DEFAULT_MIN_SCORE})",
     )
     parser.add_argument(
+        "--no-edgar", action="store_true", dest="no_edgar",
+        help="Skip the EDGAR appointment/departure detection pass",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
-        help="Detect and print bridges without writing to the database",
+        help="Detect and print bridges/moves without writing to the database",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -527,7 +772,12 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    run(days=args.days, min_score=args.min_score, dry_run=args.dry_run)
+    run(
+        days=args.days,
+        min_score=args.min_score,
+        dry_run=args.dry_run,
+        include_edgar=not args.no_edgar,
+    )
 
 
 if __name__ == "__main__":
