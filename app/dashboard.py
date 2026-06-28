@@ -333,11 +333,7 @@ def tab_weekly_brief():
         # Fall back to file-system scan for briefs generated before the table existed
         brief_files = sorted(BRIEFS_DIR.glob("brief_*.md"), reverse=True)
         if not brief_files:
-            st.info(
-                "No briefs generated yet.  \n"
-                "Run the pipeline from the sidebar, or:  \n"
-                "```\npython processing/generate_brief.py\n```"
-            )
+            st.info("No briefs generated yet. Run the pipeline from the sidebar to get started.")
             return
 
         selected_file = st.selectbox(
