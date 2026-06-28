@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
 import time
@@ -54,9 +55,11 @@ from data.init_db import init_db
 # Constants
 # ---------------------------------------------------------------------------
 
-# SEC requires a descriptive User-Agent: "Company Name contact@email.com"
-# Update this to your own contact if you deploy this in production.
-USER_AGENT = "PortfolioIntelligenceTool research@example.com"
+# SEC requires a descriptive, working User-Agent: "Company Name contact@email.com"
+# SEC will block requests from User-Agents that bounce, so this must be a real,
+# monitored address — override via SEC_USER_AGENT in .env if you deploy this
+# for someone else.
+USER_AGENT = os.getenv("SEC_USER_AGENT", "PortfolioIntelligenceTool chujohn42@gmail.com")
 
 EFTS_BASE         = "https://efts.sec.gov/LATEST/search-index"
 COMPANY_TICKERS   = "https://www.sec.gov/files/company_tickers.json"
@@ -64,8 +67,10 @@ EDGAR_ARCHIVES    = "https://www.sec.gov/Archives/edgar/data"
 
 REQUEST_INTERVAL = 0.15   # 10 req/s max → 0.1 s floor; we use 0.15 for safety
 MAX_RETRIES      = 4
-LOOKBACK_DAYS    = 90     # widened from 30 — exec-move 8-Ks are infrequent per company,
-                          # so a longer window is needed to reliably find any in a given run
+LOOKBACK_DAYS    = int(os.getenv("EDGAR_LOOKBACK_DAYS", "90"))
+# Widened from 30 — exec-move 8-Ks are infrequent per company, so a longer
+# window is needed to reliably find any in a given run. Override via
+# EDGAR_LOOKBACK_DAYS in .env, matching the LOOKBACK_DAYS pattern in fetch_news.py.
 
 # 8-K Item 5.02 keywords that indicate executive movement
 EXEC_KEYWORDS = [

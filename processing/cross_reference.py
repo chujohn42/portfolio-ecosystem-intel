@@ -627,58 +627,24 @@ def store_edgar_move(conn, mv: dict) -> bool:
 # This guarantees the Ecosystem Map always has at least a few real data
 # points to display instead of an empty table.
 #
-# These are real, publicly reported executive transitions, included from
-# general knowledge rather than fetched live — they are NOT a substitute for
-# the EDGAR pipeline and should be treated as illustrative seed data. Verify
+# Records live in data/fallback_exec_moves.json, not in this file — they are
+# real, publicly reported executive transitions, included from general
+# knowledge rather than fetched live. They are NOT a substitute for the
+# EDGAR pipeline and should be treated as illustrative seed data. Verify
 # exact dates/details against primary sources (company press releases, SEC
 # filings) before relying on them in any external-facing context.
 # ---------------------------------------------------------------------------
 
-FALLBACK_EXEC_MOVES = [
-    {
-        "person_name": "Frank Slootman",
-        "company_id":  "snowflake",
-        "direction":   "departure",
-        "old_role":    "Chief Executive Officer",
-        "new_role":    None,
-        "move_date":   "2024-02-29",
-        "note": (
-            "Frank Slootman stepped down as Snowflake's CEO in February 2024, "
-            "succeeded by Sridhar Ramaswamy. Hardcoded fallback seed data "
-            "(detected_by='manual') — verify against primary sources before "
-            "relying on exact dates."
-        ),
-    },
-    {
-        "person_name": "Sridhar Ramaswamy",
-        "company_id":  "snowflake",
-        "direction":   "appointment",
-        "old_role":    None,
-        "new_role":    "Chief Executive Officer",
-        "move_date":   "2024-02-29",
-        "note": (
-            "Sridhar Ramaswamy (co-founder of Neeva, former SVP of Ads & "
-            "Commerce at Google) was appointed Snowflake's CEO in February 2024. "
-            "Hardcoded fallback seed data (detected_by='manual') — verify "
-            "against primary sources before relying on exact dates."
-        ),
-    },
-    {
-        "person_name": "Bill Staples",
-        "company_id":  "gitlab",
-        "direction":   "appointment",
-        "old_role":    None,
-        "new_role":    "Chief Executive Officer",
-        "move_date":   "2024-06-01",
-        "note": (
-            "Bill Staples (former New Relic Chief Product Officer) was named "
-            "GitLab's CEO in 2024, succeeding founder Sid Sijbrandij, who "
-            "moved into a board/strategy role. Hardcoded fallback seed data "
-            "(detected_by='manual') — verify against primary sources before "
-            "relying on exact dates."
-        ),
-    },
-]
+FALLBACK_EXEC_MOVES_PATH = Path(__file__).parent.parent / "data" / "fallback_exec_moves.json"
+
+
+def _load_fallback_exec_moves() -> list[dict]:
+    """Load fallback exec-move records from data/fallback_exec_moves.json."""
+    if not FALLBACK_EXEC_MOVES_PATH.exists():
+        log.warning("Fallback exec moves file not found at %s — skipping.", FALLBACK_EXEC_MOVES_PATH)
+        return []
+    with open(FALLBACK_EXEC_MOVES_PATH, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def _fallback_already_seeded(conn) -> bool:
@@ -690,7 +656,8 @@ def _fallback_already_seeded(conn) -> bool:
 
 
 def seed_fallback_exec_moves(conn, dry_run: bool = False) -> int:
-    """Insert hardcoded real exec moves so the Ecosystem Map is never empty.
+    """Insert fallback exec moves (from data/fallback_exec_moves.json) so the
+    Ecosystem Map is never empty.
 
     Only runs if the target companies actually exist in this portfolio and
     no 'manual' rows have been seeded before — safe to call on every run.
@@ -699,8 +666,12 @@ def seed_fallback_exec_moves(conn, dry_run: bool = False) -> int:
         log.debug("Fallback exec moves already seeded — skipping.")
         return 0
 
+    fallback_moves = _load_fallback_exec_moves()
+    if not fallback_moves:
+        return 0
+
     inserted = 0
-    for mv in FALLBACK_EXEC_MOVES:
+    for mv in fallback_moves:
         company = conn.execute(
             "SELECT id FROM companies WHERE id = ?", (mv["company_id"],)
         ).fetchone()
