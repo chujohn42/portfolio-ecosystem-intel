@@ -195,15 +195,6 @@ def render_sidebar():
     c3.metric("Signals",    conn.execute("SELECT COUNT(*) FROM extracted_signals").fetchone()[0])
     c4.metric("Exec moves", conn.execute("SELECT COUNT(*) FROM executive_moves").fetchone()[0])
 
-    st.sidebar.divider()
-    unprocessed = conn.execute(
-        "SELECT COUNT(*) FROM news_items WHERE processed_at IS NULL"
-    ).fetchone()[0]
-    if unprocessed > 0:
-        st.sidebar.warning(f"{unprocessed} article(s) not yet processed. Run the pipeline.")
-    else:
-        st.sidebar.success("All articles processed.")
-
 
 def _run_pipeline():
     """Run the four pipeline stages in-process with per-company progress UI."""
