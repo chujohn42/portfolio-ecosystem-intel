@@ -181,9 +181,27 @@ def render_sidebar():
         st.session_state.pipeline_running = True
         st.rerun()   # redraw immediately so button shows disabled before heavy work starts
 
+    if st.session_state.get("pipeline_error"):
+        st.sidebar.error(f"Pipeline failed: {st.session_state.pipeline_error}")
+        del st.session_state["pipeline_error"]
+
     if st.session_state.pipeline_running:
-        _run_pipeline()
-        st.session_state.pipeline_running = False
+        try:
+            _run_pipeline()
+        except Exception as exc:
+            # Caught explicitly (rather than left to propagate through
+            # finally) so the failure reason survives the rerun below and
+            # gets shown to the user instead of being silently discarded.
+            st.session_state.pipeline_error = str(exc)
+        finally:
+            # Always clear the flag — even if _run_pipeline() raised — so the
+            # button never gets stuck showing "Running…" after a failure.
+            st.session_state.pipeline_running = False
+
+        # The button above was already drawn disabled earlier in this script
+        # run; without an explicit rerun it won't visually re-enable until
+        # the next interaction. Force one now, on both success and failure.
+        st.rerun()
 
     st.sidebar.divider()
     st.sidebar.subheader("Database")
